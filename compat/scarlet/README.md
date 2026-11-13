@@ -6,6 +6,49 @@ Git's repository formats, object handling, merge algorithms and transports are
 the upstream implementations. Child processes use Scarlet Environments; C and
 Rust code share the SDK runtime. There is no Linux ABI or host Git proxy.
 
+## Published bundle
+
+[GitHub Actions](https://github.com/petitstrawberry/git/actions/workflows/scarlet-release.yml)
+builds native AArch64 archives on pushes to `scarlet` and on manual dispatch.
+Pull requests build and verify without publishing. Releases use unique
+`scarlet-v2.56.1-<run>.<attempt>` tags and are marked as prereleases.
+
+The root [`bundle.toml`](../../bundle.toml) pins an archive from
+[GitHub Releases](https://github.com/petitstrawberry/git/releases).
+Add it as a Scarlet SDK rootfs layer, pinning `rev` to the desired bundle commit:
+
+```toml
+[[images.rootfs.layers]]
+kind = "bundle"
+source = { git = "https://github.com/petitstrawberry/git", rev = "scarlet" }
+```
+
+Only AArch64 has an archive and checksum. The bundle installs Git, helpers,
+templates, licenses and the CA bundle. It requires the kernel and userspace
+described below; it does not replace them.
+
+Each release includes the native archive, the exact Git source archive,
+`kernel-prerequisites.patch`, `release.json`, `bundle.toml`, installation notes
+and `SHA256SUMS`. Dependency sources are pinned in the accompanying Nix and
+Cargo lockfiles. CI checks host unit tests, HTTP whole-archive linking, native
+ELF headers, archive paths and links, executable hashes and required licenses.
+The guest acceptance recorded below is separate from this release workflow.
+
+Publishing creates a draft release, downloads and verifies every uploaded file,
+then makes the release public and commits its bundle pin to `scarlet`. Existing
+tags and releases are never overwritten. A manifest-only commit does not trigger
+another release. A failed upload check leaves the draft unpublished and the
+checked-in bundle unchanged; reruns should use a fresh tag.
+
+For a local release build from a clean committed checkout:
+
+```sh
+nix develop --accept-flake-config --command python3 -B compat/scarlet/release.py build \
+  --version scarlet-v2.56.1-local --output .scarlet-build/release
+nix develop --accept-flake-config --command python3 -B compat/scarlet/release.py verify \
+  --artifacts .scarlet-build/release
+```
+
 ## Build
 
 Clone the `scarlet` branch of <https://github.com/petitstrawberry/git>, then run:
@@ -32,13 +75,6 @@ templates, dependency licenses and a CA bundle. It also records the executable
 SHA-256 hashes in `/usr/share/git-core/scarlet-build.json`.
 Copy the staged tree into a Scarlet distribution's rootfs during its image
 build. `--destdir` must be a staging directory; the installer rejects `/`.
-
-For an archive suitable for rootfs assembly:
-
-```sh
-tar -C .scarlet-build/rootfs -czf \
-  .scarlet-build/git-2.56.1-scarlet-aarch64.tar.gz .
-```
 
 ## Kernel and runtime requirements
 

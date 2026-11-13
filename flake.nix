@@ -1,5 +1,9 @@
 {
   description = "Git for the native Scarlet ABI";
+  nixConfig = {
+    extra-substituters = [ "https://scarlet-rust-toolchain.cachix.org" ];
+    extra-trusted-public-keys = [ "scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=" ];
+  };
   inputs.scarlet-sdk.url = "github:petitstrawberry/scarlet-sdk/515e5e47eec47b2da559e8faef346fee9dc0a2bf";
   inputs.nixpkgs.follows = "scarlet-sdk/nixpkgs";
   outputs = { self, nixpkgs, scarlet-sdk }:

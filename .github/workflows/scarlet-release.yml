@@ -1,0 +1,108 @@
+name: Build and release native Scarlet Git
+
+on:
+  push:
+    branches: [scarlet]
+    paths-ignore: ['bundle.toml', 'README.md', 'Documentation/**', 'po/**']
+  pull_request:
+    branches: [scarlet]
+    paths-ignore: ['bundle.toml', 'README.md', 'Documentation/**', 'po/**']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Fresh scarlet-* release tag (empty generates a unique tag)
+        default: ''
+      publish:
+        type: boolean
+        description: Publish verified release assets and update bundle.toml on scarlet
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scarlet-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Choose release tag
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          version=$(python3 -B compat/scarlet/release.py version --requested "$REQUESTED_VERSION")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: accept-flake-config = true
+      - uses: cachix/cachix-action@v17
+        with:
+          name: scarlet-rust-toolchain
+      - name: Cache Cargo builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            compat/scarlet/process/target
+            compat/scarlet/http/target/cargo
+          key: git-scarlet-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'compat/scarlet/**/Cargo.lock') }}
+          restore-keys: |
+            git-scarlet-${{ runner.os }}-${{ runner.arch }}-
+      - name: Test release and build tooling
+        run: python3 -B -m unittest discover -s compat/scarlet/test -p 'test_*.py'
+      - name: Test native process adapter on the host
+        run: nix develop --accept-flake-config --command cargo test --locked --manifest-path compat/scarlet/process/Cargo.toml
+      - name: Build and verify native release archives
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          nix develop --accept-flake-config --command python3 -B compat/scarlet/release.py build \
+            --version "$VERSION" --output .scarlet-build/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scarlet-release
+          path: .scarlet-build/release/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    if: >-
+      github.repository == 'petitstrawberry/git' &&
+      github.ref == 'refs/heads/scarlet' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: scarlet-release
+          path: .scarlet-build/release
+      - name: Publish, download, verify and pin bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 -B compat/scarlet/publish.py --artifacts .scarlet-build/release --revision "$GITHUB_SHA"

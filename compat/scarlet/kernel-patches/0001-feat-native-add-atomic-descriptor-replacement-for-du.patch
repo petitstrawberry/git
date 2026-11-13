@@ -1,0 +1,283 @@
+From 22ad86036b37ecfdfc07494bd79a197f67b87693 Mon Sep 17 00:00:00 2001
+From: petitstrawberry <petitstrawberry.dev@gmail.com>
+Date: Fri, 13 Nov 2026 19:53:01 +0900
+Subject: [PATCH 1/2] feat(native): add atomic descriptor replacement for dup2
+
+---
+ kernel/src/fs/vfs_v2/descriptor.rs            |  16 ++-
+ kernel/src/object/handle/mod.rs               |  47 +++++++
+ .../src/object/handle/tests/handle_table.rs   | 124 ++++++++++++++++++
+ kernel/src/syscall/mod.rs                     |   1 +
+ user/lib/scarlet-abi/src/lib.rs               |   4 +
+ 5 files changed, 191 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/src/fs/vfs_v2/descriptor.rs b/kernel/src/fs/vfs_v2/descriptor.rs
+index e17944679..41b442239 100644
+--- a/kernel/src/fs/vfs_v2/descriptor.rs
++++ b/kernel/src/fs/vfs_v2/descriptor.rs
+@@ -15,7 +15,7 @@ use crate::library::std::usercopy::{copy_from_user, copy_to_user};
+ use crate::object::KernelObject;
+ use crate::object::capability::StreamError;
+ use crate::object::handle::{
+-    AccessMode, HandleMetadata, HandleTable, HandleType, SpecialSemantics,
++    AccessMode, DuplicateToError, HandleMetadata, HandleTable, HandleType, SpecialSemantics,
+ };
+ use crate::task::{Task, mytask};
+ 
+@@ -223,6 +223,20 @@ pub fn sys_handle_duplicate_with_status(tf: &mut Trapframe) -> usize {
+     duplicate(&task.handle_table, handle).unwrap_or_else(|error| error)
+ }
+ 
++pub fn sys_handle_duplicate_to_with_status(tf: &mut Trapframe) -> usize {
++    let task = mytask().unwrap();
++    let (source, target) = (tf.get_arg(0), tf.get_arg(1));
++    tf.increment_pc_next(&task);
++    let (Ok(source), Ok(target)) = (u32::try_from(source), u32::try_from(target)) else {
++        return negative(ERRNO_EBADF);
++    };
++    match task.handle_table.duplicate_to(source, target) {
++        Ok(handle) => handle as usize,
++        Err(DuplicateToError::InvalidHandle) => negative(ERRNO_EBADF),
++        Err(DuplicateToError::ReservedTarget) => negative(ERRNO_EBUSY),
++    }
++}
++
+ pub fn sys_handle_get_descriptor_flags(tf: &mut Trapframe) -> usize {
+     let task = mytask().unwrap();
+     let handle = tf.get_arg(0);
+diff --git a/kernel/src/object/handle/mod.rs b/kernel/src/object/handle/mod.rs
+index e29372832..e260cb9e6 100644
+--- a/kernel/src/object/handle/mod.rs
++++ b/kernel/src/object/handle/mod.rs
+@@ -11,6 +11,12 @@ mod tests;
+ /// Handle type for referencing kernel objects
+ pub type Handle = u32;
+ 
++#[derive(Debug, PartialEq, Eq)]
++pub enum DuplicateToError {
++    InvalidHandle,
++    ReservedTarget,
++}
++
+ /// Internal structure containing the actual handle table data.
+ /// This is wrapped in Arc<IrqRwSpinLock<...>> to enable sharing between tasks.
+ struct HandleTableInner {
+@@ -366,6 +372,47 @@ impl HandleTable {
+         Some((object.clone(), metadata.clone()))
+     }
+ 
++    /// Replace `target` atomically with a duplicate of `source`, sharing its
++    /// open-file description and access rights, with close-on-exec cleared.
++    /// A reserved slot belongs to an in-progress open; reject it without
++    /// disrupting either operation. Dispose of the old object outside the
++    /// table lock, since its final close may wake tasks or acquire other locks.
++    pub fn duplicate_to(&self, source: Handle, target: Handle) -> Result<Handle, DuplicateToError> {
++        if source as usize >= Self::MAX_HANDLES || target as usize >= Self::MAX_HANDLES {
++            return Err(DuplicateToError::InvalidHandle);
++        }
++        let replaced = {
++            let mut inner = self.inner.write();
++            if inner.handles[source as usize].is_none() || inner.metadata[source as usize].is_none()
++            {
++                return Err(DuplicateToError::InvalidHandle);
++            }
++            if source == target {
++                return Ok(target);
++            }
++            let free_index = inner
++                .free_handles
++                .iter()
++                .position(|&handle| handle == target);
++            if inner.handles[target as usize].is_none() && free_index.is_none() {
++                return Err(DuplicateToError::ReservedTarget);
++            }
++            let mut object = inner.handles[source as usize].as_ref().unwrap().clone();
++            object.ensure_handle_ownership();
++            let mut metadata = inner.metadata[source as usize].as_ref().unwrap().clone();
++            if metadata.special_semantics == Some(SpecialSemantics::CloseOnExec) {
++                metadata.special_semantics = None;
++            }
++            if let Some(index) = free_index {
++                inner.free_handles.swap_remove(index);
++            }
++            inner.metadata[target as usize] = Some(metadata);
++            inner.handles[target as usize].replace(object)
++        };
++        drop(replaced);
++        Ok(target)
++    }
++
+     /// O(1) removal
+     pub fn remove(&self, handle: Handle) -> Option<KernelObject> {
+         if handle as usize >= Self::MAX_HANDLES {
+diff --git a/kernel/src/object/handle/tests/handle_table.rs b/kernel/src/object/handle/tests/handle_table.rs
+index c33e886fb..5e6e887fc 100644
+--- a/kernel/src/object/handle/tests/handle_table.rs
++++ b/kernel/src/object/handle/tests/handle_table.rs
+@@ -1,12 +1,136 @@
+ //! HandleTable tests
+ 
+ use super::super::{AccessMode, Handle, HandleMetadata, HandleTable, HandleType, KernelObject};
++use super::super::{DuplicateToError, SpecialSemantics};
+ use super::mock::{MockFileObject, MockPipeObject};
+ use crate::device::gpu::GpuObject;
+ use crate::ipc::pipe::PipeObject;
+ use alloc::{format, sync::Arc, vec::Vec};
+ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ 
++#[test_case]
++fn duplicate_to_replaces_atomically_and_shares_file_offset() {
++    let table = HandleTable::new();
++    let source = table
++        .insert_with_metadata(
++            KernelObject::File(Arc::new(MockFileObject::new(b"abc".to_vec()))),
++            HandleMetadata {
++                handle_type: HandleType::Regular,
++                access_mode: AccessMode::ReadOnly,
++                special_semantics: Some(SpecialSemantics::CloseOnExec),
++            },
++        )
++        .unwrap();
++    let target = table
++        .insert(KernelObject::File(Arc::new(MockFileObject::new(
++            b"xyz".to_vec(),
++        ))))
++        .unwrap();
++    assert_eq!(table.duplicate_to(source, target), Ok(target));
++    assert_eq!(table.open_count(), 2);
++    assert_eq!(
++        table.get_metadata(target).unwrap().access_mode,
++        AccessMode::ReadOnly
++    );
++    assert_eq!(table.get_metadata(target).unwrap().special_semantics, None);
++    assert_eq!(
++        table.get_metadata(source).unwrap().special_semantics,
++        Some(SpecialSemantics::CloseOnExec)
++    );
++    let mut byte = [0];
++    table
++        .get_arc_clone(source)
++        .unwrap()
++        .as_stream()
++        .unwrap()
++        .read(&mut byte)
++        .unwrap();
++    assert_eq!(byte, [b'a']);
++    table
++        .get_arc_clone(target)
++        .unwrap()
++        .as_stream()
++        .unwrap()
++        .read(&mut byte)
++        .unwrap();
++    assert_eq!(byte, [b'b']);
++    assert_eq!(table.duplicate_to(source, source), Ok(source));
++    assert_eq!(
++        table.get_metadata(source).unwrap().special_semantics,
++        Some(SpecialSemantics::CloseOnExec)
++    );
++}
++
++#[test_case]
++fn duplicate_to_failures_preserve_target_and_reservations() {
++    let table = HandleTable::new();
++    let source = table
++        .insert(KernelObject::File(Arc::new(MockFileObject::new(
++            b"source".to_vec(),
++        ))))
++        .unwrap();
++    let target = table
++        .insert(KernelObject::File(Arc::new(MockFileObject::new(
++            b"target".to_vec(),
++        ))))
++        .unwrap();
++    assert_eq!(
++        table.duplicate_to(100, target),
++        Err(DuplicateToError::InvalidHandle)
++    );
++    assert_eq!(
++        table.duplicate_to(source, HandleTable::MAX_HANDLES as Handle),
++        Err(DuplicateToError::InvalidHandle)
++    );
++    assert_eq!(
++        table.duplicate_to(100, 100),
++        Err(DuplicateToError::InvalidHandle)
++    );
++    let mut bytes = [0; 6];
++    table
++        .get_arc_clone(target)
++        .unwrap()
++        .as_stream()
++        .unwrap()
++        .read(&mut bytes)
++        .unwrap();
++    assert_eq!(&bytes, b"target");
++    let reservation = table.reserve_lowest().unwrap();
++    assert_eq!(
++        table.clone().duplicate_to(source, 2),
++        Err(DuplicateToError::ReservedTarget)
++    );
++    assert_eq!(table.open_count(), 3);
++    drop(reservation);
++    assert_eq!(table.duplicate_to(source, 2), Ok(2));
++    assert_eq!(table.open_count(), 3);
++    assert_eq!(table.free_handles_len(), HandleTable::MAX_HANDLES - 3);
++    table.remove(2).unwrap();
++    assert_eq!(table.free_handles_len(), HandleTable::MAX_HANDLES - 2);
++}
++
++#[test_case]
++fn duplicate_to_releases_replaced_object_without_table_lock() {
++    let table = HandleTable::new();
++    let dropped = Arc::new(AtomicBool::new(false));
++    let count = Arc::new(AtomicUsize::new(0));
++    let source = table
++        .insert(KernelObject::File(Arc::new(MockFileObject::new(
++            b"source".to_vec(),
++        ))))
++        .unwrap();
++    let target = table
++        .insert(KernelObject::Gpu(Arc::new(ReentrantDropGpuObject {
++            table: table.clone(),
++            dropped: dropped.clone(),
++            observed_open_count: count.clone(),
++        })))
++        .unwrap();
++    assert_eq!(table.duplicate_to(source, target), Ok(target));
++    assert!(dropped.load(Ordering::SeqCst));
++    assert_eq!(count.load(Ordering::SeqCst), 2);
++}
++
+ struct ReentrantDropGpuObject {
+     table: HandleTable,
+     dropped: Arc<AtomicBool>,
+diff --git a/kernel/src/syscall/mod.rs b/kernel/src/syscall/mod.rs
+index 77af5e40c..8e00b6589 100644
+--- a/kernel/src/syscall/mod.rs
++++ b/kernel/src/syscall/mod.rs
+@@ -304,6 +304,7 @@ syscall_table! {
+     HandleGetDescriptorFlags = 108 => crate::fs::vfs_v2::descriptor::sys_handle_get_descriptor_flags,
+     HandleSetDescriptorFlags = 109 => crate::fs::vfs_v2::descriptor::sys_handle_set_descriptor_flags,
+     HandleControl = 110 => sys_handle_control,  // Control operations on handles (ioctl-equivalent)
++    HandleDuplicateToWithStatus = 111 => crate::fs::vfs_v2::descriptor::sys_handle_duplicate_to_with_status,
+ 
+     // === StreamOps Capability ===
+     // Stream operations for any KernelObject with StreamOps capability
+diff --git a/user/lib/scarlet-abi/src/lib.rs b/user/lib/scarlet-abi/src/lib.rs
+index 8dbc4fae9..59025c396 100644
+--- a/user/lib/scarlet-abi/src/lib.rs
++++ b/user/lib/scarlet-abi/src/lib.rs
+@@ -949,6 +949,10 @@ pub enum Syscall {
+     /// Set descriptor close-on-exec bit (0 or 1), returning zero or -errno.
+     HandleSetDescriptorFlags = 109,
+     HandleControl = 110,
++    /// Atomically duplicate a descriptor onto a specified slot. Returns the
++    /// target or -errno; an in-progress open reservation returns -EBUSY.
++    /// source == target validates the handle without changing descriptor flags.
++    HandleDuplicateToWithStatus = 111,
+ 
+     // Core capabilities
+     StreamRead = 200,
+-- 
+2.54.0
+
