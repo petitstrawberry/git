@@ -10,6 +10,7 @@ import stat
 import struct
 import tarfile
 import tempfile
+import zlib
 
 MANIFEST = "usr/share/git-core/scarlet-build.json"
 CA_BUNDLE = "etc/ssl/certs/ca-certificates.crt"
@@ -25,8 +26,8 @@ NOTICES = (
     "scarlet_rust_toolchain/portable-simd/LICENSE-MIT",
     "scarlet_rust_toolchain/stdarch/LICENSE-MIT",
     "http/curl-sys/LICENSE", "http/curl-sys/libcurl-COPYING",
-    "http/*/LICENSE-BoringSSL", "http/*/LICENSE-other-bits",
-    "http/rustls-[0-9]*/LICENSE-ISC", "http/rustls-ffi-*/LICENSE",
+    "http/" + "[0-9a-f]" * 7 + "*/LICENSE", "http/*/LICENSE-BoringSSL", "http/*/LICENSE-other-bits",
+    "http/rustls-[0-9]*/LICENSE-ISC", "http/rustls-ffi-*/LICENSE", "http/rustls-ffi-*/LICENSE-MIT",
     "http/rustls-webpki-*/LICENSE", "http/subtle-*/LICENSE", "http/untrusted-*/LICENSE.txt",
     *(f"http/{name}/LICENSE-MIT" for name in (
         "cfg-if-*", "getrandom-*", "libc-*", "libz-sys-*", "log-*", "once_cell-*",
@@ -111,8 +112,18 @@ def _unique(pairs):
 def verify_archive(path: Path) -> dict:
     """Return embedded provenance, or raise ValueError for invalid release contents."""
     try:
-        with tarfile.open(path, "r:gz") as archive:
+        with gzip.open(path, "rb") as compressed, tarfile.open(fileobj=compressed, mode="r:") as archive:
             members = _members(archive)
+            # tarfile stops at the first zero header, before checking gzip's CRC.
+            # Consume the trailer and reject hidden members after the tar end.
+            compressed.seek(archive.offset)
+            padding = 0
+            while block := compressed.read(1024 * 1024):
+                if block.strip(b"\0"):
+                    raise ValueError("unexpected data after tar members")
+                padding += len(block)
+            if padding < 1024 or padding % 512:
+                raise ValueError("missing or truncated tar end markers")
 
             def read(name):
                 member = members.get(name)
@@ -146,7 +157,7 @@ def verify_archive(path: Path) -> dict:
                            and member.isfile() and member.size for name, member in members.items()):
                     raise ValueError(f"missing license notice: {notice}")
             return manifest
-    except (tarfile.TarError, EOFError, UnicodeError) as error:
+    except (tarfile.TarError, EOFError, UnicodeError, gzip.BadGzipFile, zlib.error) as error:
         raise ValueError(f"invalid release archive: {error}") from error
 
 
@@ -157,7 +168,8 @@ def write_archive(stage: Path, archive_path: Path):
         raise ValueError("use a staging directory and an archive destination outside it")
     fd, temporary = tempfile.mkstemp(prefix=".scarlet-archive-", dir=archive_path.parent)
     try:
-        with os.fdopen(fd, "wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as compressed:
+        with os.fdopen(fd, "wb") as raw, gzip.GzipFile(
+                filename="", fileobj=raw, mode="wb", mtime=0, compresslevel=9) as compressed:
             with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
                 for path in sorted(stage.rglob("*")):
                     status = path.lstat()

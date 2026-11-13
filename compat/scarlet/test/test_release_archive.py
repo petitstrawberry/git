@@ -37,8 +37,8 @@ NOTICES = (
     "scarlet_rust_toolchain/portable-simd/LICENSE-MIT",
     "scarlet_rust_toolchain/stdarch/LICENSE-MIT",
     "http/curl-sys/LICENSE", "http/curl-sys/libcurl-COPYING",
-    "http/eb7e4c2/LICENSE-BoringSSL", "http/eb7e4c2/LICENSE-other-bits",
-    "http/rustls-0.23.35/LICENSE-ISC", "http/rustls-ffi-0.15.0/LICENSE",
+    "http/eb7e4c2/LICENSE", "http/eb7e4c2/LICENSE-BoringSSL", "http/eb7e4c2/LICENSE-other-bits",
+    "http/rustls-0.23.35/LICENSE-ISC", "http/rustls-ffi-0.15.0/LICENSE", "http/rustls-ffi-0.15.0/LICENSE-MIT",
     "http/rustls-webpki-0.103.8/LICENSE", "http/subtle-2.6.1/LICENSE",
     "http/untrusted-0.9.0/LICENSE.txt", "http/cfg-if-1.0.4/LICENSE-MIT",
     "http/getrandom-0.2.16/LICENSE-MIT", "http/libc-0.2.177/LICENSE-MIT",
@@ -320,6 +320,25 @@ class ReleaseArchiveTests(unittest.TestCase):
         path.write_bytes(gzip.compress(gzip.decompress(path.read_bytes())[:1000]))
         with self.assertRaises(ValueError):
             release.verify_archive(path)
+
+    def test_gzip_trailer_and_trailing_tar_data_are_checked(self):
+        path = self.unchecked_archive()
+        original = path.read_bytes()
+        for data in (original[:-8], original[:-8] + bytes(4) + original[-4:], original + b"garbage"):
+            with self.subTest(gzip_size=len(data)):
+                path.write_bytes(data)
+                with self.assertRaises(ValueError):
+                    release.verify_archive(path)
+        tar = gzip.decompress(original)
+        with tarfile.open(fileobj=io.BytesIO(tar)) as archive:
+            archive.getmembers()
+            end = archive.offset
+        hidden = tarfile.TarInfo("../../hidden").tobuf()
+        for data in (tar[:end], tar[:end] + bytes(512), tar + hidden + bytes(1024)):
+            with self.subTest(tar_size=len(data)):
+                path.write_bytes(gzip.compress(data))
+                with self.assertRaises(ValueError):
+                    release.verify_archive(path)
 
 
 if __name__ == "__main__":
