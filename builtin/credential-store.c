@@ -185,12 +185,18 @@ int cmd_credential_store(int argc,
 		OPT_END()
 	};
 
+#ifndef __scarlet__
 	umask(077);
+#endif
 
 	argc = parse_options(argc, (const char **)argv, prefix, options, usage, 0);
 	if (argc != 1)
 		usage_with_options(usage, options);
 	op = argv[0];
+#ifdef __scarlet__
+	if (strcmp(op, "get"))
+		die("credential-store cannot protect credential file permissions on Scarlet");
+#endif
 
 	if (file) {
 		string_list_append(&fns, file);

@@ -176,7 +176,12 @@ static void upload_pack_data_clear(struct upload_pack_data *data)
 
 static void reset_timeout(unsigned int timeout)
 {
+#ifdef __scarlet__
+	if (timeout)
+		die("upload-pack --timeout requires asynchronous signals, unavailable on Scarlet");
+#else
 	alarm(timeout);
+#endif
 }
 
 static void send_client_data(int fd, const char *data, ssize_t sz,

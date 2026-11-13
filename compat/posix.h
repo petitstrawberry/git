@@ -120,11 +120,17 @@
 #include <dirent.h>
 #include <sys/time.h>
 #include <time.h>
+#ifdef __scarlet__
+#include "scarlet/posix.h"
+#else
 #include <signal.h>
+#endif
 #include <assert.h>
 #include <regex.h>
+#ifndef __scarlet__
 #include <utime.h>
 #include <syslog.h>
+#endif
 #if !defined(NO_POLL_H)
 #include <poll.h>
 #elif !defined(NO_SYS_POLL_H)
@@ -142,16 +148,20 @@
 #elif defined(_MSC_VER)
 #include "msvc-posix.h"
 #else
+#ifndef __scarlet__
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #ifndef NO_WRITEV
 #include <sys/uio.h>
 #endif
+#ifndef __scarlet__
 #include <termios.h>
+#endif
 #ifndef NO_SYS_SELECT_H
 #include <sys/select.h>
 #endif
@@ -184,7 +194,9 @@ typedef long intptr_t;
 typedef unsigned long uintptr_t;
 #endif
 #undef _ALL_SOURCE /* AIX 5.3L defines a struct list with _ALL_SOURCE. */
+#ifndef __scarlet__
 #include <grp.h>
+#endif
 #define _ALL_SOURCE 1
 #endif
 

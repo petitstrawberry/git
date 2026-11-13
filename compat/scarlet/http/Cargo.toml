@@ -1,0 +1,32 @@
+[package]
+name = "scarlet-git-http"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+
+[workspace]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+curl-sys = { git = "https://github.com/petitstrawberry/curl-rust", rev = "8bec16c29cb3b706e7711ec9ead45d58321d172e", default-features = false, features = ["static-curl", "rustls"] }
+getrandom = { version = "=0.2.16", features = ["custom"] }
+libz-sys = { version = "=1.1.23", default-features = false, features = ["libc"] }
+rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-ffi = { version = "=0.15.0", default-features = false, features = ["ring", "no_log_capture"] }
+
+[patch.crates-io]
+# The build script extracts the verified upstream release and applies only
+# Scarlet's ABI declarations; this crate does not implement a second libc.
+libc = { path = "target/deps/libc-0.2.177" }
+ring = { git = "https://github.com/petitstrawberry/ring", rev = "eb7e4c269ca35a2f3b5a782c831072562d2fb219" }
+rustls-platform-verifier = { git = "https://github.com/petitstrawberry/rustls-platform-verifier", rev = "25d3b116f29e57fbe897b6c78a75941c90bee2b0" }
+
+[profile.release]
+panic = "abort"
+lto = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

@@ -64,6 +64,34 @@ void progress_test_force_update(void)
 }
 
 
+#ifdef __scarlet__
+static uint64_t progress_next_update;
+
+static void set_progress_signal(void)
+{
+	progress_update = 0;
+	progress_next_update = getnanotime() + 1000000000;
+}
+
+static void clear_progress_signal(void)
+{
+	progress_update = 0;
+}
+
+static void poll_progress_clock(void)
+{
+	uint64_t now;
+	if (progress_testing)
+		return;
+	now = getnanotime();
+	if (now >= progress_next_update) {
+		progress_update = 1;
+		progress_next_update = now + 1000000000;
+	}
+}
+#else
+static void poll_progress_clock(void) {}
+
 static void progress_interval(int signum UNUSED)
 {
 	progress_update = 1;
@@ -102,11 +130,19 @@ static void clear_progress_signal(void)
 	signal(SIGALRM, SIG_IGN);
 	progress_update = 0;
 }
+#endif
 
 static int is_foreground_fd(int fd)
 {
+#ifdef __scarlet__
+	/* Native has no foreground process groups. Callers already decide
+	 * whether progress is requested, including --progress through a pipe. */
+	(void)fd;
+	return 1;
+#else
 	int tpgrp = tcgetpgrp(fd);
 	return tpgrp < 0 || tpgrp == getpgid(0);
+#endif
 }
 
 static void display(struct progress *progress, uint64_t n, const char *done)
@@ -114,9 +150,11 @@ static void display(struct progress *progress, uint64_t n, const char *done)
 	const char *tp;
 	struct strbuf *counters_sb = &progress->counters_sb;
 	int show_update = 0;
-	int update = !!progress_update;
+	int update;
 	int last_count_len = counters_sb->len;
 
+	poll_progress_clock();
+	update = !!progress_update;
 	progress_update = 0;
 
 	if (progress->delay && (!update || --progress->delay))

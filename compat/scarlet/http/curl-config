@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+prefix=$(cd "$(dirname "$0")/.." && pwd)
+case "${1:-}" in
+    --version) echo "libcurl 8.15.0" ;;
+    --vernum) echo "080f00" ;;
+    --prefix) echo "$prefix" ;;
+    --cflags) echo "-I$prefix/include -DCURL_STATICLIB" ;;
+    --libs|--static-libs) echo "-L$prefix/lib -lcurl -lz" ;;
+    --ssl-backends) echo "Rustls" ;;
+    *) echo "unsupported curl-config option: ${1:-}" >&2; exit 1 ;;
+esac

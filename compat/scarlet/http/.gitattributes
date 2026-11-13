@@ -1,0 +1,3 @@
+# Embedded Python heredocs use space indentation.
+build.sh whitespace=trail,space,incomplete
+verify.sh whitespace=trail,space,incomplete

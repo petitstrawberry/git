@@ -104,8 +104,20 @@ int cmd_merge_file(int argc,
 	if (argc != 3)
 		usage_with_options(merge_file_usage, options);
 	if (quiet) {
-		if (!freopen("/dev/null", "w", stderr))
+		int null_fd = open("/dev/null", O_WRONLY);
+		int stderr_fd = fileno(stderr);
+		if (null_fd < 0)
+			return error_errno("failed to open /dev/null");
+		fflush(stderr);
+		if (dup2(null_fd, stderr_fd) < 0) {
+			int saved_errno = errno;
+			if (null_fd != stderr_fd)
+				close(null_fd);
+			errno = saved_errno;
 			return error_errno("failed to redirect stderr to /dev/null");
+		}
+		if (null_fd != stderr_fd)
+			close(null_fd);
 	}
 
 	if (!repo && object_id)

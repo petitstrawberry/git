@@ -1,0 +1,21 @@
+[package]
+name = "git-scarlet-process"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+name = "git_scarlet_process"
+crate-type = ["staticlib", "rlib"]
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+scarlet-abi = { git = "https://github.com/petitstrawberry/Scarlet", rev = "22ad86036b37ecfdfc07494bd79a197f67b87693" }
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "22ad86036b37ecfdfc07494bd79a197f67b87693" }
+
+[profile.release]
+panic = "abort"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

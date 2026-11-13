@@ -417,8 +417,12 @@ static int git_tar_config(const char *var, const char *value,
 {
 	if (!strcmp(var, "tar.umask")) {
 		if (value && !strcmp(value, "user")) {
+#ifdef __scarlet__
+			tar_umask = 0;
+#else
 			tar_umask = umask(0);
 			umask(tar_umask);
+#endif
 		} else {
 			tar_umask = git_config_int(var, value, ctx->kvi);
 		}

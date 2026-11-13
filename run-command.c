@@ -18,6 +18,16 @@
 #include "packfile.h"
 #include "compat/nonblock.h"
 
+#ifdef __scarlet__
+#include "compat/scarlet/process.h"
+#include <setjmp.h>
+#ifdef NO_PTHREADS
+#error "Scarlet async callbacks require the native pthread implementation"
+#endif
+/* Only descriptors explicitly selected for the child may escape these pipes. */
+#define pipe(fds) pipe2((fds), O_CLOEXEC)
+#endif
+
 void child_process_init(struct child_process *child)
 {
 	struct child_process blank = CHILD_PROCESS_INIT;
@@ -308,7 +318,7 @@ static const char **prepare_shell_cmd(struct strvec *out, const char **argv)
 	return out->v;
 }
 
-#ifndef GIT_WINDOWS_NATIVE
+#if !defined(GIT_WINDOWS_NATIVE) && !defined(__scarlet__)
 static int child_notifier = -1;
 
 enum child_errcode {
@@ -406,7 +416,9 @@ static void child_err_spew(struct child_process *cmd, struct child_err *cerr)
 	}
 	set_error_routine(old_errfn);
 }
+#endif
 
+#ifndef GIT_WINDOWS_NATIVE
 static int prepare_cmd(struct strvec *out, const struct child_process *cmd)
 {
 	if (!cmd->args.v[0])
@@ -447,6 +459,7 @@ static int prepare_cmd(struct strvec *out, const struct child_process *cmd)
 	return 0;
 }
 
+#ifndef __scarlet__
 static char **prep_childenv(const char *const *deltaenv)
 {
 	extern char **environ;
@@ -545,6 +558,7 @@ static void atfork_parent(struct atfork_state *as)
 		"restoring signal mask");
 #endif
 }
+#endif /* !__scarlet__ */
 
 #endif /* GIT_WINDOWS_NATIVE */
 
@@ -680,6 +694,14 @@ int start_command(struct child_process *cmd)
 	int fdin[2], fdout[2], fderr[2];
 	int failed_errno;
 	const char *str;
+#ifdef __scarlet__
+	/* Observe closed streams before pipe/open can reuse their numbers. */
+	int inherited_stdio[3];
+	for (int i = 0; i < 3; i++) {
+		int flags = fcntl(i, F_GETFD);
+		inherited_stdio[i] = flags < 0 || (flags & FD_CLOEXEC) ? -1 : i;
+	}
+#endif
 
 	/*
 	 * In case of errors we must keep the promise to close FDs
@@ -745,7 +767,63 @@ fail_pipe:
 	if (cmd->odb_to_close)
 		odb_close(cmd->odb_to_close);
 
-#ifndef GIT_WINDOWS_NATIVE
+#ifdef __scarlet__
+{
+	int null_fd = -1;
+	int input = inherited_stdio[0];
+	int output = inherited_stdio[1];
+	int error = inherited_stdio[2];
+	struct strvec argv = STRVEC_INIT;
+
+	cmd->pid = -1;
+	if (prepare_cmd(&argv, cmd) < 0) {
+		failed_errno = errno;
+		if (!cmd->silent_exec_failure)
+			error_errno("cannot run %s", cmd->args.v[0]);
+		goto end_of_native_spawn;
+	}
+	if (cmd->no_stdin || cmd->no_stdout || cmd->no_stderr)
+		null_fd = xopen("/dev/null", O_RDWR | O_CLOEXEC);
+	if (cmd->no_stdin)
+		input = null_fd;
+	else if (need_in)
+		input = fdin[0];
+	else if (cmd->in)
+		input = cmd->in;
+	if (cmd->no_stderr)
+		error = null_fd;
+	else if (need_err)
+		error = fderr[1];
+	else if (cmd->err > 1)
+		error = cmd->err;
+	if (cmd->no_stdout)
+		output = null_fd;
+	else if (cmd->stdout_to_stderr)
+		output = error;
+	else if (need_out)
+		output = fdout[1];
+	else if (cmd->out > 1)
+		output = cmd->out;
+
+	trace_argv_printf(&argv.v[1], "trace: start_command:");
+	cmd->pid = scarlet_spawnve(argv.v[1], argv.v + 1, cmd->env.v,
+				   cmd->dir, input, output, error,
+				   cmd->close_fd_above_stderr);
+	if (cmd->pid < 0 && errno == ENOEXEC)
+		cmd->pid = scarlet_spawnve(argv.v[0], argv.v, cmd->env.v,
+					   cmd->dir, input, output, error,
+					   cmd->close_fd_above_stderr);
+	failed_errno = errno;
+	if (cmd->pid < 0 && (!cmd->silent_exec_failure || errno != ENOENT))
+		error_errno("cannot spawn %s", cmd->args.v[0]);
+	if (cmd->pid >= 0 && cmd->clean_on_exit)
+		mark_child_for_cleanup(cmd->pid, cmd);
+	if (null_fd >= 0)
+		close(null_fd);
+	strvec_clear(&argv);
+}
+end_of_native_spawn:
+#elif !defined(GIT_WINDOWS_NATIVE)
 {
 	int notify_pipe[2];
 	int null_fd = -1;
@@ -1038,11 +1116,33 @@ static int main_thread_set;
 static pthread_key_t async_key;
 static pthread_key_t async_die_counter;
 
+#ifdef __scarlet__
+static pthread_key_t async_exit_key;
+struct scarlet_async_exit {
+	jmp_buf target;
+	volatile intptr_t code;
+};
+
+static NORETURN void async_exit(int code)
+{
+	struct scarlet_async_exit *state = pthread_getspecific(async_exit_key);
+	if (!state)
+		BUG("async exit outside its callback");
+	state->code = code;
+	/* Both ends of this jump are in C, inside Rust's pthread trampoline. */
+	longjmp(state->target, 1);
+}
+#endif
+
 static void *run_thread(void *data)
 {
 	struct async *async = data;
 	intptr_t ret;
+#ifdef __scarlet__
+	struct scarlet_async_exit state = { 0 };
+#endif
 
+#ifndef __scarlet__
 	if (async->isolate_sigpipe) {
 		sigset_t mask;
 		sigemptyset(&mask);
@@ -1052,9 +1152,21 @@ static void *run_thread(void *data)
 			return (void *)ret;
 		}
 	}
+#endif
 
 	pthread_setspecific(async_key, async);
+#ifdef __scarlet__
+	/* Native pipe writes return EPIPE; they do not deliver POSIX SIGPIPE. */
+	pthread_setspecific(async_exit_key, &state);
+	if (setjmp(state.target))
+		ret = state.code;
+	else
+		ret = async->proc(async->proc_in, async->proc_out, async->data);
+	pthread_setspecific(async_exit_key, NULL);
+	pthread_setspecific(async_key, NULL);
+#else
 	ret = async->proc(async->proc_in, async->proc_out, async->data);
+#endif
 	return (void *)ret;
 }
 
@@ -1070,7 +1182,11 @@ static NORETURN void die_async(const char *err, va_list params)
 			close(async->proc_in);
 		if (async->proc_out >= 0)
 			close(async->proc_out);
+#ifdef __scarlet__
+		async_exit(128);
+#else
 		pthread_exit((void *)128);
+#endif
 	}
 
 	exit(128);
@@ -1090,10 +1206,12 @@ int in_async(void)
 	return !pthread_equal(main_thread, pthread_self());
 }
 
+#ifndef __scarlet__
 static void NORETURN async_exit(int code)
 {
 	pthread_exit((void *)(intptr_t)code);
 }
+#endif
 
 #else
 
@@ -1242,6 +1360,9 @@ int start_async(struct async *async)
 		main_thread = pthread_self();
 		pthread_key_create(&async_key, NULL);
 		pthread_key_create(&async_die_counter, NULL);
+#ifdef __scarlet__
+		pthread_key_create(&async_exit_key, NULL);
+#endif
 		set_die_routine(die_async);
 		set_die_is_recursing_routine(async_die_is_recursing);
 	}

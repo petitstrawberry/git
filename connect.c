@@ -1542,7 +1542,21 @@ struct child_process *git_connect(int fd[2], const char *url,
 					     version);
 			}
 		}
-		strvec_push(&conn->args, cmd.buf);
+#ifdef __scarlet__
+		/* The stock local services are builtins. Preserve the pathname as
+		 * one argument instead of round-tripping it through /bin/sh, whose
+		 * current native implementation is not a POSIX shell. Custom service
+		 * commands and SSH retain their normal shell semantics. */
+		if (scheme != URL_SCHEME_SSH &&
+		    (!strcmp(prog, "git-upload-pack") ||
+		     !strcmp(prog, "git-receive-pack") ||
+		     !strcmp(prog, "git-upload-archive"))) {
+			conn->use_shell = 0;
+			conn->git_cmd = 1;
+			strvec_pushl(&conn->args, prog + 4, path, NULL);
+		} else
+#endif
+			strvec_push(&conn->args, cmd.buf);
 
 		if (start_command(conn))
 			die(_("unable to fork"));

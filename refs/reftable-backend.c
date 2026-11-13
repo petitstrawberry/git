@@ -366,8 +366,13 @@ static const struct reftable_be_write_options *reftable_be_write_options(struct 
 	if (opts->initialized)
 		return opts;
 
+#ifdef __scarlet__
+	/* Native filesystems do not have a process umask. */
+	mask = 0;
+#else
 	mask = umask(0);
 	umask(mask);
+#endif
 
 	opts->opts.default_permissions = calc_shared_perm(refs->base.repo, 0666 & ~mask);
 	opts->opts.disable_auto_compact =

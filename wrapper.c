@@ -573,7 +573,14 @@ static int git_mkdstemps_mode(char *pattern, int suffix_len, int mode, bool dir)
 
 char *git_mkdtemp(char *pattern)
 {
+#ifdef __scarlet__
+	/* Native directories inherit the Environment's filesystem access. There
+	 * are no POSIX owner/group permission classes; use the supported creation
+	 * mode rather than claiming to create a private 0700 directory. */
+	return git_mkdstemps_mode(pattern, 0, 0755, true) ? NULL : pattern;
+#else
 	return git_mkdstemps_mode(pattern, 0, 0700, true) ? NULL : pattern;
+#endif
 }
 
 int git_mkstemps_mode(char *pattern, int suffix_len, int mode)

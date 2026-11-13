@@ -441,6 +441,7 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 		static char locking_host[HOST_NAME_MAX + 1];
 		static char *scan_fmt;
 		int should_exit;
+		char pid_line[HOST_NAME_MAX + 32];
 
 		if (!scan_fmt)
 			scan_fmt = xstrfmt("%s %%%ds", "%"SCNuMAX, HOST_NAME_MAX);
@@ -459,7 +460,8 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 			 * running.
 			 */
 			time(NULL) - st.st_mtime <= 12 * 3600 &&
-			fscanf(fp, scan_fmt, &pid, locking_host) == 2 &&
+			fgets(pid_line, sizeof(pid_line), fp) &&
+			sscanf(pid_line, scan_fmt, &pid, locking_host) == 2 &&
 			/* be gentle to concurrent "gc" on remote hosts */
 			(strcmp(locking_host, my_host) || !kill(pid, 0) || errno == EPERM);
 		if (fp)
