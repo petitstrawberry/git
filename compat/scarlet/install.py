@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--destdir", required=True, type=Path)
@@ -21,7 +22,15 @@ if dest == Path("/"):
 def copy(source, target):
     target = dest / target
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+    # Nix certificates and license files are read-only. Replace a previous
+    # installation atomically instead of opening that read-only file in place.
+    fd, temporary = tempfile.mkstemp(prefix=".git-install-", dir=target.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return target
 
 def link(value, target):
@@ -94,6 +103,7 @@ provenance = {
     "source_repository": "https://github.com/petitstrawberry/git",
     "source_revision": source_revision,
     "source_dirty": source_dirty,
+    "git_version": (root / "GIT-VERSION-FILE").read_text().partition("=")[2].strip(),
 }
 kernel_revision = root / "compat/scarlet/kernel-revision"
 if kernel_revision.exists():
